@@ -1677,3 +1677,21 @@ def test_sibling_modules_are_this_copys_not_an_older_one(freya, monkeypatch):
     monkeypatch.setitem(sys.modules, "talaria_build", types.ModuleType("talaria_build"))
     assert hasattr(appserver._build(), "freya_home")
     assert appserver._build() is appserver._build()  # loaded once per copy
+
+
+def test_talarias_desktop_plugin_goes_once_freyas_runs(freya, tmp_path):
+    """desktop-on: Freya's Desktop half says it's on. Talaria's hand-installed one beside it goes; not before Freya's
+    is there, and never a package's half."""
+    root = tmp_path / "desktop-plugins"
+    (root / "talaria").mkdir(parents=True)
+    (root / "talaria" / "plugin.js").write_text("// talaria")
+    assert json.loads(freya.handle_command("desktop-on")) == {"retired": False}  # Freya's half isn't here: Talaria's stays
+    assert (root / "talaria" / "plugin.js").exists()
+    (root / "freya").mkdir()
+    (root / "freya" / "plugin.js").write_text("// freya")
+    (root / "talaria" / ".hermes-package.json").write_text("{}")
+    assert json.loads(freya.handle_command("desktop-on")) == {"retired": False}  # a package's half isn't ours to remove
+    (root / "talaria" / ".hermes-package.json").unlink()
+    assert json.loads(freya.handle_command("desktop-on")) == {"retired": True}
+    assert not (root / "talaria").exists() and (root / "freya" / "plugin.js").exists()
+    assert json.loads(freya.handle_command("desktop-on")) == {"retired": False}  # again: nothing left

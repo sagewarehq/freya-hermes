@@ -27,7 +27,7 @@ from . import push, store
 
 logger = logging.getLogger(__name__)
 
-VERSION = "0.16.3"
+VERSION = "0.16.4"
 # What the clients can ask of it; they offer an update below what they need. 2: catalog and install. 3: push.
 # 4: inbox rows and pushes name their profile. 5: the plugin is freya (it was talaria; /talaria still answers).
 API = 5
@@ -369,7 +369,7 @@ def on_human_input_resolved(session_id: str = "", **_: Any) -> None:
 
 
 USAGE = ("usage: /freya version | migrate [--check|--start|--status] | whoami | inbox [--json] | apps | open <app> [--via <host>] | action <app> <name> [base64 json]"
-         " | catalog | install <app> | db-check | app-icon <app> <icon|image|none> | app-image <app> [--png]"
+         " | desktop-on | catalog | install <app> | db-check | app-icon <app> <icon|image|none> | app-image <app> [--png]"
          " | app-color <app> <color|none> | pin <app> | unpin <app>"
          " | page <session_id> <base64 json> | voice <session_id> on|off | dismiss <session_id> [turn_id] | classify <session_id>"
          " | push register <relay> <handle> <send_key> <key> | push forget <handle> | push test <handle> | push status")
@@ -515,6 +515,8 @@ def handle_command(raw_args: str = "") -> str:
             return store.to_json(migrate.run(store.home(), store.data()))
         except (OSError, RuntimeError) as e:
             return store.to_json({"ok": False, "error": str(e)})
+    if sub == "desktop-on":  # Freya's Desktop half is on (it says so as it starts): Talaria's can go
+        return store.to_json({"retired": retire_talaria_desktop()})
     if sub == "db-check":  # is SQLite here for apps' databases, and how to add what's missing (db.py --check)
         from . import actions
         return store.to_json(actions.db_module().check())
@@ -598,6 +600,21 @@ def legacy_beside() -> bool:
     removes talaria). Until it's gone, talaria keeps the hooks, so each turn is recorded and pushed once."""
     from pathlib import Path
     return (Path(__file__).resolve().parent.parent / "talaria" / "plugin.yaml").exists()
+
+
+def retire_talaria_desktop() -> bool:
+    """Talaria's Desktop plugin, installed by hand before the rename (``desktop-plugins/talaria/``, no package marker),
+    goes once Freya's Desktop half runs in a Desktop on this machine (``desktop-plugins/freya/``, which Desktop copies
+    out of this package, or Install put there). Not before: Desktop leaves a package's half off until it's switched on,
+    and Talaria's pages are the ones there until then. A Desktop on another machine keeps its own folder; there,
+    Talaria's is turned off in Desktop's Plugins."""
+    import shutil
+    root = store.home() / "desktop-plugins"
+    old, new = root / "talaria", root / "freya"
+    if not (old / "plugin.js").is_file() or (old / ".hermes-package.json").exists() or not (new / "plugin.js").is_file():
+        return False
+    shutil.rmtree(old, ignore_errors=True)
+    return not old.exists()
 
 
 def register(ctx) -> None:
