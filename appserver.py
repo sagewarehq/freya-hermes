@@ -31,6 +31,24 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+
+
+def _by_path(path):
+    """``path`` loaded as a module once per copy of it. The key names the file and when it last changed: a Hermes
+    that runs for days kept the copy it loaded first under a fixed name (Talaria's build.py, without freya_home; an
+    older Freya's after an update)."""
+    import hashlib
+    import importlib.util
+    st = path.stat()
+    key = "freya_" + path.stem + "_" + hashlib.sha1(f"{path.resolve()}:{st.st_mtime_ns}:{st.st_size}".encode()).hexdigest()[:12]
+    mod = sys.modules.get(key)
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(key, path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        # Only once it's whole: requests answer on threads, and a second one mustn't get a half-run module.
+        mod = sys.modules.setdefault(key, mod)
+    return mod
 TEMPLATE = HERE / "workspace" / "talaria"
 NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")
 RESERVED = {"apps", "shared", "talaria", "node_modules", "lib", "legacy", "assets"}  # as in talaria/apps.mjs
@@ -50,14 +68,7 @@ _error: str | None = None
 
 
 def _build():
-    import importlib.util
-    mod = sys.modules.get("talaria_build")
-    if mod is None:  # build.py from beside this file, by path, as preview.py loads actions.py
-        spec = importlib.util.spec_from_file_location("talaria_build", HERE / "build.py")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        sys.modules["talaria_build"] = mod
-    return mod
+    return _by_path(HERE / "build.py")  # beside this file, by path, as preview.py loads actions.py
 
 
 def home() -> Path:

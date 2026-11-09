@@ -49,6 +49,24 @@ class BuildError(Exception):
     pass
 
 
+def _by_path(path):
+    """``path`` loaded as a module once per copy of it. The key names the file and when it last changed: a Hermes
+    that runs for days kept the copy it loaded first under a fixed name (Talaria's build.py, without freya_home; an
+    older Freya's after an update)."""
+    import hashlib
+    import importlib.util
+    st = path.stat()
+    key = "freya_" + path.stem + "_" + hashlib.sha1(f"{path.resolve()}:{st.st_mtime_ns}:{st.st_size}".encode()).hexdigest()[:12]
+    mod = sys.modules.get(key)
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(key, path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        # Only once it's whole: requests answer on threads, and a second one mustn't get a half-run module.
+        mod = sys.modules.setdefault(key, mod)
+    return mod
+
+
 def icons() -> tuple[str, ...]:
     """The icons an app may wear (icons.py), loaded by path: this file runs as a script, outside the package."""
     import importlib.util
@@ -245,13 +263,7 @@ def migrate_db(name: str) -> None:
     """Apply the app's migrations/ to its app.db (db.py), so a routine finds its tables before the page first asks."""
     if not (built(name) / "migrations").is_dir():
         return
-    import importlib.util
-    db = sys.modules.get("talaria_db")
-    if db is None:
-        spec = importlib.util.spec_from_file_location("talaria_db", HERE / "db.py")
-        db = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(db)
-        db = sys.modules.setdefault("talaria_db", db)
+    db = _by_path(HERE / "db.py")
     try:
         db.connect(built(name).parent, name).close()
     except Exception as e:

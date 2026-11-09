@@ -213,17 +213,28 @@ def read_file(target: Path, within: Path) -> tuple[int, bytes, str]:
     return 200, data, kind
 
 
+def _by_path(path):
+    """``path`` loaded as a module once per copy of it. The key names the file and when it last changed: a Hermes
+    that runs for days kept the copy it loaded first under a fixed name (Talaria's build.py, without freya_home; an
+    older Freya's after an update)."""
+    import hashlib
+    import importlib.util
+    st = path.stat()
+    key = "freya_" + path.stem + "_" + hashlib.sha1(f"{path.resolve()}:{st.st_mtime_ns}:{st.st_size}".encode()).hexdigest()[:12]
+    mod = sys.modules.get(key)
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(key, path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        # Only once it's whole: requests answer on threads, and a second one mustn't get a half-run module.
+        mod = sys.modules.setdefault(key, mod)
+    return mod
+
+
 def actions_module():
     """actions.py from beside this file, loaded by path: preview.py runs both as a script and inside the backend,
     where putting the plugin's folder on sys.path could shadow other modules."""
-    import importlib.util
-    mod = sys.modules.get("talaria_actions")
-    if mod is None:
-        spec = importlib.util.spec_from_file_location("talaria_actions", HERE / "actions.py")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        sys.modules["talaria_actions"] = mod
-    return mod
+    return _by_path(HERE / "actions.py")
 
 
 def local_origin(origin: str) -> bool:

@@ -27,7 +27,7 @@ from . import push, store
 
 logger = logging.getLogger(__name__)
 
-VERSION = "0.16.2"
+VERSION = "0.16.3"
 # What the clients can ask of it; they offer an update below what they need. 2: catalog and install. 3: push.
 # 4: inbox rows and pushes name their profile. 5: the plugin is freya (it was talaria; /talaria still answers).
 API = 5

@@ -1667,3 +1667,13 @@ def test_subagent_rows_from_before_are_cleared(freya, tmp_path):
     c = sqlite3.connect(db)
     assert c.execute("SELECT count(*) FROM attention WHERE platform='subagent'").fetchone()[0] == 0
     c.close()
+
+
+def test_sibling_modules_are_this_copys_not_an_older_one(freya, monkeypatch):
+    """A Hermes running since Talaria still had Talaria's build.py as talaria_build (no freya_home); and after an
+    update, the older copy's. Each copy of a file is its own module."""
+    import types
+    from freya_plugin import appserver
+    monkeypatch.setitem(sys.modules, "talaria_build", types.ModuleType("talaria_build"))
+    assert hasattr(appserver._build(), "freya_home")
+    assert appserver._build() is appserver._build()  # loaded once per copy
