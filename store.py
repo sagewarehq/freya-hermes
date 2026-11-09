@@ -97,7 +97,14 @@ def connect(path: Optional[Path] = None) -> sqlite3.Connection:
     conn.executescript(SCHEMA)
     if "profile" not in {r[1] for r in conn.execute("PRAGMA table_info(attention)")}:
         conn.execute("ALTER TABLE attention ADD COLUMN profile TEXT")  # a store from before profiles
+    global _purged
+    if not _purged:  # subagents a store from before 0.16.2 kept: gone, once per process
+        _purged = True
+        conn.execute("DELETE FROM attention WHERE platform='subagent'")
     return conn
+
+
+_purged = False
 
 
 def own_start_time() -> Optional[float]:
@@ -126,7 +133,7 @@ def set_state(session_id: str, state: str, *, reason: Optional[str] = None, turn
               conn: Optional[sqlite3.Connection] = None) -> None:
     """Upsert a session's state, stamped with this process as the writer. ``new_turn`` clears a
     dismissal: the next turn raises a dismissed session again."""
-    if not session_id:
+    if not session_id or platform == "subagent":  # subagents aren't kept (the plugin's hooks skip them)
         return
     own = conn is None
     c = conn or connect()
@@ -242,7 +249,8 @@ def inbox(conn: Optional[sqlite3.Connection] = None, *, max_age_s: float = 3 * 8
     try:
         rows = c.execute(
             "SELECT session_id, state, reason, turn_id, platform, updated, writer_pid, writer_start, dismissed_turn, profile"
-            " FROM attention WHERE updated > ? ORDER BY updated DESC", (time.time() - max_age_s,)).fetchall()
+            " FROM attention WHERE updated > ? AND COALESCE(platform, '') != 'subagent' ORDER BY updated DESC",
+            (time.time() - max_age_s,)).fetchall()
     finally:
         if own:
             c.close()

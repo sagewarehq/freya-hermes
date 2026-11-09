@@ -194,7 +194,7 @@ def test_registers_the_app_skill(freya):
     toolset, schema, handler = ctx.tools["app_snapshot"]
     assert toolset == "freya" and schema["name"] == "app_snapshot"
     assert json.loads(handler({})) == {"error": "No app page is shared with Hermes."}  # no apps server running
-    assert ctx.commands == ["freya", "talaria"] and len(ctx.hooks) == 7  # /talaria: the old name, still answered
+    assert ctx.commands == ["freya", "talaria"] and len(ctx.hooks) == 9  # /talaria: the old name, still answered
 
 
 
@@ -1619,3 +1619,51 @@ def test_migrate_a_routine_hermes_refuses_stays_and_the_rest_go(freya, tmp_path,
     assert done["state"] == "done" and done["routines"] == ["Fine"]
     assert done["routines_failed"] == ["Gone: Cron workdir does not exist"]
     assert jobs[0]["workdir"] == "/root/.hermes/talaria/apps/gone" and jobs[1]["prompt"] == "/freya:app"
+
+
+def test_subagents_are_not_kept(freya, monkeypatch):
+    """delegate_task's children: no rows, no end-of-turn check; their parent's row is what's running."""
+    classified = []
+    monkeypatch.setattr(freya, "_classify_turn", lambda *a: classified.append(a))
+    freya.on_session_start(session_id="parent", platform="desktop")
+    freya.subagent_start(parent_session_id="parent", child_session_id="kid")
+    freya.on_session_start(session_id="kid", platform="subagent")
+    freya.pre_llm_call(session_id="kid", turn_id="k1", platform="subagent")
+    freya.on_session_end(session_id="kid", turn_id="k1", platform="subagent", completed=True)
+    freya.on_session_start(session_id="stray", platform="subagent")  # one subagent_start never named
+    assert [r["session_id"] for r in inbox(freya)] == ["parent"]
+    assert "kid" not in freya.store.known() and classified == []
+
+
+def test_a_subagents_approval_shows_on_its_parent(freya):
+    freya.on_session_start(session_id="parent", platform="desktop")
+    freya.subagent_start(parent_session_id="parent", child_session_id="kid")
+    freya.on_session_start(session_id="kid", platform="subagent")
+    freya.pre_approval_request(session_id="kid", command="rm -rf build", description="Delete build output")
+    rows = inbox(freya)
+    assert [(r["session_id"], r["state"], r["reason"]) for r in rows] == [("parent", "approval", "Delete build output")]
+    freya.post_approval_response(session_id="kid", choice="once")
+    assert [(r["session_id"], r["state"]) for r in inbox(freya)] == [("parent", "running")]
+    freya.on_human_input_request(session_id="kid", kind="clarify", prompt="Which folder?")
+    assert inbox(freya)[0]["state"] == "question" and inbox(freya)[0]["session_id"] == "parent"
+    freya.on_human_input_resolved(session_id="kid")
+    assert inbox(freya)[0]["state"] == "running"
+    freya.subagent_stop(child_session_id="kid")
+    assert not freya.is_subagent("kid")
+
+
+def test_subagent_rows_from_before_are_cleared(freya, tmp_path):
+    import sqlite3
+    db = tmp_path / "freya" / "attention.db"
+    freya.on_session_start(session_id="s1", platform="desktop")
+    c = sqlite3.connect(db)
+    c.executemany("INSERT INTO attention (session_id, state, platform, updated) VALUES (?, 'idle', 'subagent', ?)",
+                  [(f"sub{i}", time.time()) for i in range(335)])
+    c.commit()
+    c.close()
+    assert [r["session_id"] for r in inbox(freya)] == ["s1"]  # never shown
+    freya.store._purged = False  # a new process
+    freya.store.connect().close()
+    c = sqlite3.connect(db)
+    assert c.execute("SELECT count(*) FROM attention WHERE platform='subagent'").fetchone()[0] == 0
+    c.close()

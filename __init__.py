@@ -27,7 +27,7 @@ from . import push, store
 
 logger = logging.getLogger(__name__)
 
-VERSION = "0.16.1"
+VERSION = "0.16.2"
 # What the clients can ask of it; they offer an update below what they need. 2: catalog and install. 3: push.
 # 4: inbox rows and pushes name their profile. 5: the plugin is freya (it was talaria; /talaria still answers).
 API = 5
@@ -44,13 +44,56 @@ def _safe(fn):
     return wrapper
 
 
+# MARK: subagents
+# delegate_task's children: a busy run spawns hundreds, and each one's turns, end-of-turn check (a model call) and row
+# in Overview were too much. They're not recorded at all: their parent's row is what's running. Only what a subagent
+# asks of you shows, on its parent's row (its approval or question blocks the parent's turn).
+_SUBAGENTS: dict[str, str] = {}  # child session -> its parent's ("" until subagent_start says)
+_SUBAGENTS_MAX = 2000
+
+
+def _remember_subagent(child: str, parent: str = "") -> None:
+    if not child:
+        return
+    if parent or child not in _SUBAGENTS:
+        _SUBAGENTS[child] = parent or _SUBAGENTS.get(child, "")
+    while len(_SUBAGENTS) > _SUBAGENTS_MAX:
+        _SUBAGENTS.pop(next(iter(_SUBAGENTS)))
+
+
+def is_subagent(session_id: str, platform: str = "") -> bool:
+    if platform == "subagent":
+        _remember_subagent(session_id)
+        return True
+    return session_id in _SUBAGENTS
+
+
+@_safe
+def subagent_start(parent_session_id: str = "", child_session_id: str = "", **_: Any) -> None:
+    _remember_subagent(child_session_id or "", parent_session_id or "")
+
+
+@_safe
+def subagent_stop(child_session_id: str = "", **_: Any) -> None:
+    _SUBAGENTS.pop(child_session_id or "", None)
+
+
+def _asker(session_id: str) -> str:
+    """The session whose row shows an approval or question: a subagent's parent ("" when it's not known)."""
+    return _SUBAGENTS.get(session_id, "") if session_id in _SUBAGENTS else session_id
+
+
 @_safe
 def on_session_start(session_id: str = "", platform: str = "", **_: Any) -> None:
+    if is_subagent(session_id, platform):
+        return
     store.set_state(session_id, "running", platform=platform, new_turn=True)
 
 
 @_safe
 def _turn_starts(session_id: str, turn_id: str, platform: str) -> None:
+    if is_subagent(session_id, platform):
+        return
     # on_session_start only fires on a session's first turn, so without this a reply to a "needs you"
     # turn left that row up and its end went unclassified.
     store.set_state(session_id, "running", turn_id=turn_id or None, platform=platform, new_turn=True)
@@ -185,6 +228,8 @@ def app_code(name: str) -> str | None:
 @_safe
 def on_session_end(session_id: str = "", turn_id: str = "", platform: str = "", completed: bool = True,
                    failed: bool = False, interrupted: bool = False, **_: Any) -> None:
+    if is_subagent(session_id, platform):
+        return
     if store.get_state(session_id) not in store.LIVE_STATES:
         return
     store.set_state(session_id, "idle", turn_id=turn_id, platform=platform)
@@ -291,28 +336,36 @@ def parse_verdict(raw: str) -> tuple[bool, str] | None:
 @_safe
 def pre_approval_request(session_id: str = "", command: str = "", description: str = "", turn_id: str = "", **_: Any) -> None:
     what = (description or command or "an action").strip()
-    store.set_state(session_id, "approval", reason=what[:300], turn_id=turn_id or None)
-    push.notify(session_id, "approval", what[:300], turn_id)
+    sid = _asker(session_id)
+    if not sid:
+        return
+    store.set_state(sid, "approval", reason=what[:300], turn_id=(turn_id or None) if sid == session_id else None)
+    push.notify(sid, "approval", what[:300], turn_id if sid == session_id else "")
 
 
 @_safe
 def post_approval_response(session_id: str = "", **_: Any) -> None:
-    if store.get_state(session_id) == "approval":
-        store.set_state(session_id, "running")
+    sid = _asker(session_id)
+    if sid and store.get_state(sid) == "approval":
+        store.set_state(sid, "running")
 
 
 @_safe
 def on_human_input_request(session_id: str = "", kind: str = "", prompt: str = "", **_: Any) -> None:
     # Secrets and admin passwords also come through here; never record their prompt text.
     reason = (prompt or "").strip()[:300] if kind in ("clarify", "question") else kind or "input"
-    store.set_state(session_id, "question", reason=reason)
-    push.notify(session_id, "question", reason)
+    sid = _asker(session_id)
+    if not sid:
+        return
+    store.set_state(sid, "question", reason=reason)
+    push.notify(sid, "question", reason)
 
 
 @_safe
 def on_human_input_resolved(session_id: str = "", **_: Any) -> None:
-    if store.get_state(session_id) == "question":
-        store.set_state(session_id, "running")
+    sid = _asker(session_id)
+    if sid and store.get_state(sid) == "question":
+        store.set_state(sid, "running")
 
 
 USAGE = ("usage: /freya version | migrate [--check|--start|--status] | whoami | inbox [--json] | apps | open <app> [--via <host>] | action <app> <name> [base64 json]"
@@ -555,7 +608,8 @@ def register(ctx) -> None:
                          ("pre_approval_request", pre_approval_request),
                          ("post_approval_response", post_approval_response),
                          ("on_human_input_request", on_human_input_request),
-                         ("on_human_input_resolved", on_human_input_resolved)):
+                         ("on_human_input_resolved", on_human_input_resolved),
+                         ("subagent_start", subagent_start), ("subagent_stop", subagent_stop)):
             ctx.register_hook(name, fn)
     # Skills, as /freya:app and /freya:routine: how to build an app Freya opens, and how to set
     # up a routine that reads well in its Routines list (skills/*/SKILL.md).
