@@ -27,7 +27,7 @@ from . import push, store
 
 logger = logging.getLogger(__name__)
 
-VERSION = "0.16.0"
+VERSION = "0.16.1"
 # What the clients can ask of it; they offer an update below what they need. 2: catalog and install. 3: push.
 # 4: inbox rows and pushes name their profile. 5: the plugin is freya (it was talaria; /talaria still answers).
 API = 5
@@ -315,7 +315,7 @@ def on_human_input_resolved(session_id: str = "", **_: Any) -> None:
         store.set_state(session_id, "running")
 
 
-USAGE = ("usage: /freya version | migrate [--check] | whoami | inbox [--json] | apps | open <app> [--via <host>] | action <app> <name> [base64 json]"
+USAGE = ("usage: /freya version | migrate [--check|--start|--status] | whoami | inbox [--json] | apps | open <app> [--via <host>] | action <app> <name> [base64 json]"
          " | catalog | install <app> | db-check | app-icon <app> <icon|image|none> | app-image <app> [--png]"
          " | app-color <app> <color|none> | pin <app> | unpin <app>"
          " | page <session_id> <base64 json> | voice <session_id> on|off | dismiss <session_id> [turn_id] | classify <session_id>"
@@ -450,10 +450,14 @@ def handle_command(raw_args: str = "") -> str:
         return store.to_json({"ok": keep_page(args[1], shot)})
     if sub == "voice" and len(args) == 3 and args[2] in ("on", "off"):  # the phone's voice chat on a session
         return store.to_json({"ok": set_voice(args[1], args[2] == "on")})
-    if sub == "migrate" and args[1:] in ([], ["--check"]):  # Talaria → Freya on this server, once (migrate.py)
+    if sub == "migrate" and args[1:] in ([], ["--check"], ["--start"], ["--status"]):  # Talaria → Freya (migrate.py)
         from . import migrate
         if args[1:] == ["--check"]:
             return store.to_json(migrate.check(store.home(), store.data()))
+        if args[1:] == ["--start"]:  # in the background: the phone only watches (--status)
+            return store.to_json(migrate.start(store.home(), store.data()))
+        if args[1:] == ["--status"]:
+            return store.to_json(migrate.status(store.home()))
         try:
             return store.to_json(migrate.run(store.home(), store.data()))
         except (OSError, RuntimeError) as e:

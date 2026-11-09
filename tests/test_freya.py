@@ -1490,3 +1490,132 @@ def test_migrate_on_a_new_server_has_nothing_to_do(freya, tmp_path):
     freya.on_session_start(session_id="s1")
     assert json.loads(freya.handle_command("migrate --check")) == {"pending": False, "data": "freya", "apps": 0, "files": 0, "memories": 0}
     assert not (tmp_path / "talaria").exists()
+
+
+def _fake_cron(monkeypatch, jobs_by_home):
+    """Hermes's cron module, as migrate uses it: a store per profile home, list_jobs and update_job."""
+    import contextlib
+    import types
+    current = {}
+    jobs = types.SimpleNamespace()
+
+    @contextlib.contextmanager
+    def use_cron_store(home):
+        current["home"] = str(home)
+        yield
+    jobs.use_cron_store = use_cron_store
+    jobs.list_jobs = lambda include_disabled=False: jobs_by_home.get(current["home"], [])
+    def update_job(job_id, updates):
+        for job in jobs_by_home[current["home"]]:
+            if job["id"] == job_id:
+                job.update(updates)
+                return job
+    jobs.update_job = update_job
+    cron = types.ModuleType("cron")
+    cron.jobs = jobs
+    monkeypatch.setitem(sys.modules, "cron", cron)
+    monkeypatch.setitem(sys.modules, "cron.jobs", jobs)
+
+
+def _await_move(freya, seconds=10):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        s = json.loads(freya.handle_command("migrate --status"))
+        if s["state"] != "running":
+            return s
+        time.sleep(0.05)
+    raise AssertionError("the move didn't finish")
+
+
+def test_migrate_in_the_background_moves_data_and_routines(freya, tmp_path, monkeypatch):
+    """--start answers at once and the move carries on without the phone; --status says how it went."""
+    _talaria_server(tmp_path)
+    (tmp_path / "cron").mkdir()
+    (tmp_path / "cron" / "jobs.json").write_text("[]")
+    (tmp_path / "profiles" / "personal" / "cron").mkdir(parents=True)
+    (tmp_path / "profiles" / "personal" / "cron" / "jobs.json").write_text("[]")
+    root_jobs = [{"id": "a", "name": "Newsroom", "prompt": "Run /talaria:app news", "workdir": "/root/.hermes/talaria/apps/news",
+                  "skills": ["talaria:routine"], "skill": "talaria:routine"},
+                 {"id": "b", "name": "Untouched", "prompt": "Say hi"}]
+    personal = [{"id": "c", "name": "Balances", "script": "python3 ~/.hermes/plugins/talaria/db.py bank"}]
+    _fake_cron(monkeypatch, {str(tmp_path): root_jobs, str(tmp_path / "profiles" / "personal"): personal})
+    assert json.loads(freya.handle_command("migrate --status")) == {"state": "none"}
+    started = json.loads(freya.handle_command("migrate --start"))
+    assert started["state"] == "running" and started["id"]
+    done = _await_move(freya)
+    assert done["state"] == "done" and done["id"] == started["id"]
+    assert done["steps"] == {"data": "done", "routines": "done", "apps": "skipped"}
+    assert sorted(done["routines"]) == ["Balances", "Newsroom"]
+    assert root_jobs[0]["prompt"] == "Run /freya:app news" and root_jobs[0]["workdir"] == "/root/.hermes/freya/apps/news"
+    assert root_jobs[0]["skills"] == ["freya:routine"] and root_jobs[0]["skill"] == "freya:routine"
+    assert root_jobs[1] == {"id": "b", "name": "Untouched", "prompt": "Say hi"}
+    assert personal[0]["script"] == "python3 ~/.hermes/plugins/freya/db.py bank"
+    assert (tmp_path / "freya").is_dir() and (tmp_path / "talaria").is_symlink()
+    again = _await_move(freya) if json.loads(freya.handle_command("migrate --start"))["state"] == "running" else None
+    assert again["state"] == "done" and again["routines"] == []  # again: nothing left, nothing harmed
+
+
+def test_migrate_in_the_background_leaves_routines_to_an_older_hermes(freya, tmp_path, monkeypatch):
+    _talaria_server(tmp_path)
+    monkeypatch.setitem(sys.modules, "cron", None)  # no cron module to import
+    json.loads(freya.handle_command("migrate --start"))
+    done = _await_move(freya)
+    assert done["state"] == "done" and done["steps"]["routines"] == "phone"
+
+
+def test_migrate_status_says_a_dead_run_stalled(freya, tmp_path):
+    (tmp_path / ".freya-migrate.json").write_text(json.dumps({"id": "x", "state": "running", "beat": time.time() - 600,
+                                                              "steps": {}}))
+    assert json.loads(freya.handle_command("migrate --status"))["state"] == "stalled"
+    started = json.loads(freya.handle_command("migrate --start"))  # a stalled run starts over
+    assert started["id"] != "x"
+    assert _await_move(freya)["state"] == "done"
+
+
+def test_migrate_reports_a_failure(freya, tmp_path, monkeypatch):
+    _talaria_server(tmp_path)
+    from freya_plugin import migrate
+    def broken(root, data):
+        raise RuntimeError("disk full")
+    monkeypatch.setattr(migrate, "run", broken)
+    freya.handle_command("migrate --start")
+    done = _await_move(freya)
+    assert done["state"] == "failed" and done["steps"]["data"] == "failed" and done["error"] == "disk full"
+
+
+def test_migrate_a_slow_step_is_not_a_stall(freya, tmp_path, monkeypatch):
+    """A step that writes nothing for a while (the apps server's npm install) is still running while its thread is,
+    and --start doesn't start a second run beside it."""
+    import threading
+    from freya_plugin import migrate
+    _talaria_server(tmp_path)
+    monkeypatch.setattr(migrate, "STALE", 0.1)
+    release = threading.Event()
+    monkeypatch.setattr(migrate, "restart_apps", lambda: (release.wait(10), "done")[1])
+    first = json.loads(freya.handle_command("migrate --start"))
+    time.sleep(0.5)
+    assert json.loads(freya.handle_command("migrate --status"))["state"] == "running"
+    assert json.loads(freya.handle_command("migrate --start"))["id"] == first["id"]
+    release.set()
+    assert _await_move(freya)["state"] == "done"
+
+
+def test_migrate_a_routine_hermes_refuses_stays_and_the_rest_go(freya, tmp_path, monkeypatch):
+    _talaria_server(tmp_path)
+    (tmp_path / "cron").mkdir()
+    (tmp_path / "cron" / "jobs.json").write_text("[]")
+    jobs = [{"id": "a", "name": "Gone", "workdir": "/root/.hermes/talaria/apps/gone"},
+            {"id": "b", "name": "Fine", "prompt": "/talaria:app"}]
+    _fake_cron(monkeypatch, {str(tmp_path): jobs})
+    from freya_plugin import migrate
+    real = sys.modules["cron"].jobs.update_job
+    def picky(job_id, updates):
+        if "workdir" in updates:
+            raise ValueError("Cron workdir does not exist")
+        return real(job_id, updates)
+    sys.modules["cron"].jobs.update_job = picky
+    freya.handle_command("migrate --start")
+    done = _await_move(freya)
+    assert done["state"] == "done" and done["routines"] == ["Fine"]
+    assert done["routines_failed"] == ["Gone: Cron workdir does not exist"]
+    assert jobs[0]["workdir"] == "/root/.hermes/talaria/apps/gone" and jobs[1]["prompt"] == "/freya:app"
